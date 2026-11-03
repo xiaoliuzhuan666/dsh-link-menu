@@ -1,0 +1,4 @@
+.DS_Store
+*.dshbak
+*.bak
+node_modules/
