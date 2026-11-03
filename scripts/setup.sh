@@ -117,6 +117,15 @@ if [ "${1:-}" = "--status" ]; then
     log "  ✗ not registered in $PROFILE/package.json"
   fi
   log ""
+  if grep -q '^strictDepBuilds: false' "$PROFILE/pnpm-workspace.yaml" 2>/dev/null; then
+    log "  ✓ pnpm permits gated build scripts (strictDepBuilds: false)"
+  else
+    log "  ! $PROFILE/pnpm-workspace.yaml lacks strictDepBuilds: false"
+    log "    a git-hosted plugin whose build script is blocked makes 'dsh plugin add'"
+    log "    exit non-zero even though the package installed; see"
+    log "    docs/2026-11-03-dsh-purge-allowBuilds-阻断插件安装.md"
+  fi
+  log ""
   log "app patches (should all be clean):"
   stale_state || log "  ✓ none — the app is unmodified"
   exit 0
