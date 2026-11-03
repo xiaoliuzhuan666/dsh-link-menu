@@ -31,13 +31,25 @@
     "LICENSE"
   ],
   "exports": {
-    ".": { "default": "./lib/index.js" },
-    "./client": { "default": "./lib/client.js" },
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./package.json": "./package.json"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
   },
   "engines": {
     "node": ">=20",
@@ -47,6 +59,8 @@
     "@deepseek-ai/cordis": "^4.0.5"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
   }
 }
