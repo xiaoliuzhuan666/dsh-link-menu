@@ -1,37 +1,45 @@
 #!/usr/bin/env bash
-# Add a right-click menu to links in the DSH desktop chat, and make external
-# links open in the browser.
+# Install (or remove) dsh-link-menu, a PURE PLUGIN that adds a right-click menu
+# to links in the DSH desktop chat.
 #
-#   bash dsh-link-menu-setup.sh              # apply everything
-#   bash dsh-link-menu-setup.sh --status     # what is applied
-#   bash dsh-link-menu-setup.sh --revert     # undo every file edit
+#   bash dsh-link-menu-setup.sh              # install / update
+#   bash dsh-link-menu-setup.sh --status     # what is installed
+#   bash dsh-link-menu-setup.sh --revert     # remove the plugin, restore app files
 #
 # What you get
 # ------------
-#   file link right-click → Reveal in Finder · Copy File Path
+#   file link right-click → Reveal in Finder · Copy File Path · Copy Relative Path
 #   http link right-click → Open in Browser  · Copy Link Address
-#   http link left click  → opens the system browser
 #
-# Why FOUR pieces
-# ---------------
-# This is not one patch. Each piece is load-bearing; drop one and the feature
-# silently stops working:
+# What this script does NOT do
+# ----------------------------
+# It does not modify the application. No bundle patch, no ui-chat patch, no
+# Electron main-process patch. Everything the menu needs already exists in a
+# stock install:
 #
-#   1. dsh-web-frontend bundle  — stamps data-dsh-file-path / -abs on the
-#      rendered link buttons. React props are not DOM attributes, so a plugin
-#      cannot read the path otherwise. This is the file the BROWSER loads;
-#      editing dsh-client-ui-* alone changes nothing.
-#   2. dsh-client-ui-chat       — passes the session cwd into the markdown
-#      delegate context, so piece 1 can resolve a relative path to absolute.
-#   3. lib/main.js              — the window's setWindowOpenHandler denies every
-#      window.open; hand http(s) to shell.openExternal first.
-#   4. the plugin               — captures contextmenu and calls the Host Remote
-#      session.openWorkspacePath({ action: "reveal" }), which is the only place
-#      that can reveal a HOST path (the workspace root lives in the Host).
+#   * the file path        → `title` on the <button> the markdown renderer
+#                            already produces (and on the edited-file card)
+#   * the workspace root   → ctx.sessions.list.getSnapshot().byId[id].cwd
+#   * the session id       → data-conversation-session on the conversation root
+#   * the reveal           → remote.session.openWorkspacePath({action:"reveal"})
 #
-# The reveal path must be ABSOLUTE: fs.processPathFromHostPath returns
-# undefined for anything relative, and the Host rejects it with
-# "Path has no verified Host path".
+# All four were verified against 0.2.1-rc.5. That is why the plugin can ship
+# from GitHub with `dsh plugin add` and needs no setup script at all — this
+# script only exists to install it on a machine where the CLI is not handy, and
+# to clean up the three app patches an earlier version of this feature applied.
+#
+# Why the earlier version patched the app, and why that was wrong
+# --------------------------------------------------------------
+# It assumed the path never reached the DOM and that the sidebar/chat window
+# killed link clicks. Both were wrong: the path is in `title`, and the chat
+# window's setWindowOpenHandler already forwards http(s) itself. The one handler
+# that really was deny-only lives in `DesktopPolicyTestAuth` (the login window),
+# so patching it changed auth behaviour and fixed nothing. See
+# docs/2026-11-03-DSH链接右键调研事故复盘.md in the skillshare repo.
+#
+# The reveal path must be ABSOLUTE: fs.processPathFromHostPath returns undefined
+# for anything relative, and the Host rejects it with "Path has no verified Host
+# path". The plugin joins `cwd` + `title` before calling the Remote.
 set -euo pipefail
 
 APP="${DSH_APP:-/Applications/DeepSeek Harness.app}"
@@ -42,6 +50,13 @@ FRONTEND_DIR="$RES/app/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist"
 PROFILE="${DSH_PROFILE_DIR:-$HOME/.dsh/profiles/desktop}"
 PLUGIN="$PROFILE/node_modules/dsh-link-menu"
 
+# Markers left by the patch-era version, so --status and --revert can find them.
+STALE_BUNDLE='data-dsh-file-abs'
+STALE_MAIN='a malformed URL is not worth an error surface'
+# The ui-chat marker spans two lines, so it cannot be a `grep -F` pattern:
+# grep splits an embedded newline into several alternatives and any one hit
+# would report a false positive on the unpatched file. Check it with python.
+
 log()  { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -49,45 +64,98 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 Set DSH_APP to your app bundle."
 
 # The bundle filename carries a build hash that changes between app versions.
-# Read it from index.html instead of hardcoding.
 BUNDLE_REL="$(grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' "$FRONTEND_DIR/index.html" 2>/dev/null | head -1)"
-[ -n "$BUNDLE_REL" ] || fail "cannot find the JS bundle reference in $FRONTEND_DIR/index.html"
-BUNDLE="$FRONTEND_DIR/$BUNDLE_REL"
+BUNDLE=""
+[ -n "$BUNDLE_REL" ] && BUNDLE="$FRONTEND_DIR/$BUNDLE_REL"
+
+chat_patched() {
+  [ -f "$CHAT" ] || return 1
+  python3 - "$CHAT" <<'PY'
+import sys
+t = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
+needle = "fileImages,\n\t\t\t\t\t\t\t\t\t\tcwd,"
+sys.exit(0 if needle in t else 1)
+PY
+}
+
+stale_state() { # prints one line per leftover app patch; true (1) when clean
+  local found=1
+  if [ -n "$BUNDLE" ] && [ -f "$BUNDLE" ] && grep -qF "$STALE_BUNDLE" "$BUNDLE" 2>/dev/null; then
+    log "  ! bundle still stamped (data-dsh-file-abs) — a patch-era leftover"; found=0
+  fi
+  if chat_patched; then
+    log "  ! ui-chat still passes cwd — a patch-era leftover"; found=0
+  fi
+  if [ -f "$MAIN" ] && grep -qF "$STALE_MAIN" "$MAIN" 2>/dev/null; then
+    log "  ! main.js still carries the mis-targeted window-open patch"; found=0
+  fi
+  return $found
+}
+
+restore_from_backup() { # restore_from_backup <file> <label>
+  local f="$1" label="$2"
+  if [ -f "$f.dshbak" ]; then
+    cp "$f.dshbak" "$f"
+    log "  restored $label from $f.dshbak"
+  else
+    log "  ! $label still patched and no .dshbak to restore it from"
+  fi
+}
 
 # ---------------------------------------------------------------- status ---
 if [ "${1:-}" = "--status" ]; then
-  check() { # check <file> <marker> <label>
-    if [ -f "$1" ] && grep -qF "$2" "$1" 2>/dev/null; then log "  ✓ $3"; else log "  ✗ $3"; fi
-  }
-  log "app: $APP"
-  log "bundle: ${BUNDLE_REL:-<missing>}"
+  log "app:    $APP"
   log "plugin: $PLUGIN"
   log ""
-  check "$BUNDLE" "data-dsh-file-abs"        "1. bundle stamps data-dsh-file-abs"
-  check "$CHAT"   "fileImages,
-										cwd,"      "2. ui-chat passes cwd"
-  check "$MAIN"   "shell.openExternal(url)"  "3. main.js opens external links"
-  if [ -f "$PLUGIN/lib/client.js" ]; then log "  ✓ 4. plugin installed"; else log "  ✗ 4. plugin installed"; fi
+  if [ -f "$PLUGIN/lib/client.js" ]; then log "  ✓ plugin installed"; else log "  ✗ plugin not installed"; fi
+  local_ok=0
+  grep -qF "data-dsh-link-menu" "$PLUGIN/lib/client.js" 2>/dev/null && local_ok=1
+  [ "$local_ok" = 1 ] && log "  ✓ client half looks like this version"
+  if grep -q '"dsh-link-menu"' "$PROFILE/package.json" 2>/dev/null; then
+    log "  ✓ registered in profile bundles"
+  else
+    log "  ✗ not registered in $PROFILE/package.json"
+  fi
   log ""
-  log "backups:"
-  for f in "$BUNDLE" "$CHAT" "$MAIN"; do
-    [ -f "$f.dshbak" ] && log "  $f.dshbak"
-  done
+  log "app patches (should all be clean):"
+  stale_state || log "  ✓ none — the app is unmodified"
   exit 0
 fi
 
 # ---------------------------------------------------------------- revert ---
 if [ "${1:-}" = "--revert" ]; then
-  for f in "$BUNDLE" "$CHAT" "$MAIN"; do
-    if [ -f "$f.dshbak" ]; then
-      cp "$f.dshbak" "$f"
-      log "reverted: $f"
-    fi
-  done
+  log "== removing the plugin =="
+  rm -rf "$PLUGIN"
+  log "  removed $PLUGIN"
+  python3 - "$PROFILE" <<'PY'
+import json, os, sys
+profile = sys.argv[1]
+path = os.path.join(profile, "package.json")
+if not os.path.exists(path):
+    print("  profile manifest missing; nothing to deregister")
+    raise SystemExit(0)
+data = json.load(open(path))
+bundles = data.get("dsh", {}).get("profile", {}).get("bundles", [])
+if "dsh-link-menu" in bundles:
+    data["dsh"]["profile"]["bundles"] = [b for b in bundles if b != "dsh-link-menu"]
+    json.dump(data, open(path, "w"), indent=2, ensure_ascii=False)
+    open(path, "a").write("\n")
+    print("  deregistered from profile bundles")
+else:
+    print("  already absent from profile bundles")
+PY
   log ""
-  log "The plugin stays installed; remove it with:"
-  log "  rm -rf $PLUGIN"
-  log "  # then drop \"dsh-link-menu\" from $PROFILE/package.json"
+  log "== restoring any patch-era app edits =="
+  # Restore ONLY what is actually still patched. Copying a .dshbak over a clean
+  # file would overwrite the user's current app with a possibly stale baseline,
+  # which is worse than leaving a harmless leftover alone.
+  if stale_state; then
+    [ -n "$BUNDLE" ] && grep -qF "$STALE_BUNDLE" "$BUNDLE" 2>/dev/null && restore_from_backup "$BUNDLE" "bundle"
+    chat_patched && restore_from_backup "$CHAT" "ui-chat"
+    grep -qF "$STALE_MAIN" "$MAIN" 2>/dev/null && restore_from_backup "$MAIN" "main.js"
+  else
+    log "  ✓ nothing patched; no app file was touched"
+  fi
   log ""
   log "quit and reopen DeepSeek Harness to take effect"
   exit 0
@@ -95,210 +163,49 @@ fi
 
 [ -z "${1:-}" ] || fail "unknown option: $1 (use --status or --revert)"
 
-# ---------------------------------------------------------------- apply ---
-python3 - "$BUNDLE" "$CHAT" "$MAIN" "$PLUGIN" "$PROFILE" <<'PY'
-import json, os, pathlib, shutil, sys
+# ---------------------------------------------------------------- install --
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Two layouts ship this script:
+#   <repo>/scripts/setup.sh  with the package at <repo>/            (published repo)
+#   <repo>/scripts/dsh-link-menu-setup.sh with it at scripts/dsh-link-menu/  (skillshare)
+if [ -f "$HERE/package.json" ] && grep -q '"dsh-link-menu"' "$HERE/package.json" 2>/dev/null; then
+  PKG_SRC="$HERE"
+elif [ -f "$HERE/dsh-link-menu/package.json" ]; then
+  PKG_SRC="$HERE/dsh-link-menu"
+elif [ -f "$HERE/../package.json" ] && grep -q '"dsh-link-menu"' "$HERE/../package.json" 2>/dev/null; then
+  PKG_SRC="$(cd "$HERE/.." && pwd)"
+else
+  fail "cannot find the dsh-link-menu package next to $HERE
+Expected <here>/package.json, <here>/dsh-link-menu/package.json, or <here>/../package.json."
+fi
 
-bundle, chat, main, plugin, profile = sys.argv[1:6]
-notes = []
-
-def backup(path):
-    b = path + ".dshbak"
-    if not os.path.exists(b):
-        shutil.copy2(path, b)
-        notes.append(f"backup: {b}")
-
-def edit(path, pairs, label):
-    """Apply (old, new, marker) triples in file order.
-
-    `marker` is a short, stable string that exists only in the patched file. It
-    decides idempotency, because `new` may contain prose that differs between
-    app builds and would make an already-patched file look unpatched.
-    """
-    t = open(path, encoding="utf-8", errors="surrogateescape").read()
-    changed = False
-    for old, new, marker in pairs:
-        if marker in t:                   # already applied
-            continue
-        if old not in t:
-            sys.exit(f"anchor not found in {path}: {label}\n"
-                     f"  the app changed; re-derive this anchor from the live file\n"
-                     f"  missing marker: {marker!r}")
-        t = t.replace(old, new, 1)
-        changed = True
-    if changed:
-        open(path, "w", encoding="utf-8", errors="surrogateescape").write(t)
-        notes.append(f"patched: {path}")
-    else:
-        notes.append(f"already patched: {path}")
-
-# ---- 1. the bundle the browser loads --------------------------------------
-backup(bundle)
-edit(bundle, [
-    # 1a. file-mention button: stamp the visible path and the resolved one
-    (
-      'function cU({file:e,glyph:t,children:r}){const{openFile:i,fileImages:n}=f4();'
-      'if(i===void 0)return d.jsx(d.Fragment,{children:r});const s=t&&I1(e.path)==="image"?n:void 0,'
-      'l=s?.resolve(e.path),u=d.jsxs("button",{type:"button",className:he(St.fileMention,St.fileLink),'
-      '"data-dsh-file-path":e.path,',
-      'function cU({file:e,glyph:t,children:r}){const{openFile:i,fileImages:n,cwd:cw}=f4();'
-      'if(i===void 0)return d.jsx(d.Fragment,{children:r});const s=t&&I1(e.path)==="image"?n:void 0,'
-      'l=s?.resolve(e.path),absPath=cw!==void 0&&cw!==""&&!(e.path.startsWith("/")||/^[A-Za-z]:[/\\\\]/.test(e.path))'
-      '?cw.replace(/\\\\/g,"/").replace(/\\/+$/,"")+"/"+e.path.replace(/^\\.\\//,""):e.path,'
-      'u=d.jsxs("button",{type:"button",className:he(St.fileMention,St.fileLink),'
-      '"data-dsh-file-path":e.path,"data-dsh-file-abs":absPath,',
-      'data-dsh-file-abs":absPath',      # marker: unique to the patched cU
-    ),
-    # 1b. inline-code file mention
-    (
-      'return s!==void 0?d.jsx("code",{children:d.jsxs("button",{type:"button",'
-      'className:St.fileMention,"data-dsh-file-path":i,',
-      'return s!==void 0?d.jsx("code",{children:d.jsxs("button",{type:"button",'
-      'className:St.fileMention,"data-dsh-file-path":i,'
-      '"data-dsh-file-abs":(function(){try{const q=s&&s.cwd;if(typeof q!=="string"||q==="")return i;'
-      'if(i.startsWith("/")||/^[A-Za-z]:[/\\\\]/.test(i))return i;'
-      'return q.replace(/\\\\/g,"/").replace(/\\/+$/,"")+"/"+i.replace(/^\\.\\//,"")}catch{return i}})(),',
-      'catch{return i}})(),',            # marker: unique to the patched inlineCode
-    ),
-    # 1c. markdown delegate provider must forward cwd
-    (
-      'function XF({children:e,openExternalLink:t,openFile:r,fileImages:i}){'
-      'const n=C.useMemo(()=>({openExternalLink:t,openFile:r,fileImages:i}),[t,r,i]);',
-      'function XF({children:e,openExternalLink:t,openFile:r,fileImages:i,cwd:a}){'
-      'const n=C.useMemo(()=>({openExternalLink:t,openFile:r,fileImages:i,cwd:a}),[t,r,i,a]);',
-      'fileImages:i,cwd:a}),[t,r,i,a])',  # marker: unique to the patched provider
-    ),
-], "bundle link stamping")
-
-# ---- 2. ui-chat: hand cwd to the markdown context -------------------------
-backup(chat)
-edit(chat, [
-    (
-      '(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.MarkdownDelegateProvider, {\n'
-      '\t\t\t\t\t\t\t\t\t\topenFile: requestOpenFile,\n'
-      '\t\t\t\t\t\t\t\t\t\topenExternalLink,\n'
-      '\t\t\t\t\t\t\t\t\t\tfileImages,',
-      '(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.MarkdownDelegateProvider, {\n'
-      '\t\t\t\t\t\t\t\t\t\topenFile: requestOpenFile,\n'
-      '\t\t\t\t\t\t\t\t\t\topenExternalLink,\n'
-      '\t\t\t\t\t\t\t\t\t\tfileImages,\n'
-      '\t\t\t\t\t\t\t\t\t\tcwd,',
-      'fileImages,\n\t\t\t\t\t\t\t\t\t\tcwd,',   # marker: unique to the patched provider call
-    ),
-], "ui-chat cwd")
-
-# ---- 3. main.js: external links -----------------------------------------
-backup(main)
-edit(main, [
-    (
-      '\t\tcontents.setWindowOpenHandler(() => ({ action: "deny" }));\n'
-      '\t\tcontents.on("will-navigate", (event, url) => {\n'
-      '\t\t\tif (!this.allowed(url)) {',
-      '\t\tcontents.setWindowOpenHandler(({ url }) => {\n'
-      '\t\t\t// A chat link calls window.open(url, "_blank"). A deny-only handler\n'
-      '\t\t\t// swallowed every one of those clicks: nothing opened, no error.\n'
-      '\t\t\t// Hand http(s) to the system browser, deny the rest \u2014 same posture\n'
-      '\t\t\t// as the WebContentsView handler above.\n'
-      '\t\t\ttry {\n'
-      '\t\t\t\tconst destination = new URL(url);\n'
-      '\t\t\t\tif ((destination.protocol === "https:" || destination.protocol === "http:") && !destination.username && !destination.password)\n'
-      '\t\t\t\t\tshell.openExternal(url).catch(() => {});\n'
-      '\t\t\t} catch {\n'
-      '\t\t\t\t/* a malformed URL is not worth an error surface */\n'
-      '\t\t\t}\n'
-      '\t\t\treturn { action: "deny" };\n'
-      '\t\t});\n'
-      '\t\tcontents.on("will-navigate", (event, url) => {\n'
-      '\t\t\tif (!this.allowed(url)) {',
-      'a malformed URL is not worth an error surface',   # marker: unique to the patched handler
-    ),
-], "main.js window-open")
-
-# ---- 4. the plugin --------------------------------------------------------
-os.makedirs(os.path.join(plugin, "lib"), exist_ok=True)
-notes.append(f"plugin dir: {plugin}")
-
-print("\n".join(notes))
-PY
+log "== 1/3 copying the plugin =="
+rm -rf "$PLUGIN"
+mkdir -p "$PLUGIN"
+# Copy exactly the package, not the enclosing repository: in the published
+# layout PKG_SRC is the repo root, which also holds scripts/ and docs.
+for item in package.json cordis.patch.yml lib; do
+  [ -e "$PKG_SRC/$item" ] || fail "package is missing $item (looked in $PKG_SRC)"
+  cp -R "$PKG_SRC/$item" "$PLUGIN/"
+done
+log "  $PLUGIN"
 
 log ""
-log "1/4 bundle, 2/4 ui-chat, 3/4 main.js patched"
-
-# ---- 4. write the plugin files -------------------------------------------
-mkdir -p "$PLUGIN/lib"
-
-cat > "$PLUGIN/package.json" <<'JSON'
-{
-  "name": "dsh-link-menu",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Right-click menu for chat links: reveal in Finder, copy path, open in browser, copy link address.",
-  "type": "module",
-  "main": "lib/index.js",
-  "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web" },
-    "manifestVersion": 1
-  },
-  "exports": {
-    ".": { "default": "./lib/index.js" },
-    "./client": { "default": "./lib/client.js" },
-    "./package.json": "./package.json"
-  },
-  "engines": { "node": ">=20" },
-  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.5" }
-}
-JSON
-
-cat > "$PLUGIN/cordis.patch.yml" <<'YAML'
-# Bundle patch: the row that mounts this plugin.
-# A manual row in the profile's own cordis.patch.yml mounts the HOST half only;
-# the client half loads through the bundle channel.
-- insert:
-    - id: dsh-link-menu
-      name: dsh-link-menu
-YAML
-
-cat > "$PLUGIN/lib/index.js" <<'JS'
-/**
- * Host half of dsh-link-menu.
- *
- * All the work is in the browser. This file exists because the client-module
- * scanner skips any loader entry whose Host fiber never started, so a
- * client-only plugin still needs a Host half that imports cleanly.
- */
-
-export const name = "dsh-link-menu";
-
-/** Nothing is read from the Host context. */
-export const inject = [];
-
-/** Intentionally empty. */
-export function apply() {}
-JS
-
-# The plugin source ships in ../plugin/client.js, next to this script's directory.
-TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/plugin/client.js"
-[ -f "$TEMPLATE" ] || fail "plugin template missing: $TEMPLATE
-It ships beside this script; copy it there before running."
-cp "$TEMPLATE" "$PLUGIN/lib/client.js"
-
-log "4/4 plugin written: $PLUGIN"
-
-# ---- register in the profile ---------------------------------------------
+log "== 2/3 registering it in the profile =="
 python3 - "$PROFILE" <<'PY'
-import json, os, sys, yaml
+import json, os, sys
 profile = sys.argv[1]
-pkg_path = os.path.join(profile, "package.json")
-data = json.load(open(pkg_path))
+os.makedirs(profile, exist_ok=True)
+path = os.path.join(profile, "package.json")
+data = json.load(open(path)) if os.path.exists(path) else {"name": "dsh-profile", "private": True}
 bundles = data.setdefault("dsh", {}).setdefault("profile", {}).setdefault("bundles", [])
-if "dsh-link-menu" not in bundles:
-    bundles.append("dsh-link-menu")
-    json.dump(data, open(pkg_path, "w"), indent=2, ensure_ascii=False)
-    open(pkg_path, "a").write("\n")
-    print("registered in profile bundles")
+if "dsh-link-menu" in bundles:
+    print("  already in profile bundles")
 else:
-    print("already in profile bundles")
+    bundles.append("dsh-link-menu")
+    json.dump(data, open(path, "w"), indent=2, ensure_ascii=False)
+    open(path, "a").write("\n")
+    print("  added to profile bundles")
 
 # A leftover manual mount would double-mount the plugin.
 patch_path = os.path.join(profile, "cordis.patch.yml")
@@ -310,8 +217,19 @@ if os.path.exists(patch_path):
         if end != -1:
             end += len("# <<< dsh-link-menu <<<\n")
             open(patch_path, "w", encoding="utf-8").write(t[:start] + t[end:])
-            print("removed a leftover manual mount")
+            print("  removed a leftover manual mount")
 PY
+
+log ""
+log "== 3/3 cleaning up patch-era app edits =="
+if stale_state; then
+  log "  reverting them now (the plugin no longer needs any of them):"
+  [ -n "$BUNDLE" ] && restore_from_backup "$BUNDLE" "bundle"
+  restore_from_backup "$CHAT" "ui-chat"
+  restore_from_backup "$MAIN" "main.js"
+else
+  log "  ✓ nothing to clean — the app was never patched, or is already clean"
+fi
 
 log ""
 log "done. quit and reopen DeepSeek Harness."

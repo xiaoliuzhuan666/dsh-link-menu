@@ -1,0 +1,11 @@
+# Bundle patch: the loader row that mounts this plugin.
+#
+# The Host half (package main -> lib/index.js) runs as an ordinary loader entry.
+# The Client half (exports["./client"] -> lib/client.js, declared through
+# dsh.client.platform) is served to the web shell over the boot manifest.
+#
+# No application file is modified. Nothing here patches dsh-web-frontend,
+# dsh-client-ui-chat or the Electron main process.
+- insert:
+    - id: dsh-link-menu
+      name: dsh-link-menu

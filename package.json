@@ -1,0 +1,52 @@
+{
+  "name": "dsh-link-menu",
+  "version": "1.0.0",
+  "description": "Right-click menu for DeepSeek Harness chat links: reveal in Finder, copy absolute/relative path, open in browser, copy link address. Pure plugin — no app patch.",
+  "license": "MIT",
+  "author": "xiaoliuzhuan666",
+  "homepage": "https://github.com/xiaoliuzhuan666/dsh-link-menu#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoliuzhuan666/dsh-link-menu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaoliuzhuan666/dsh-link-menu/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "context-menu",
+    "right-click",
+    "link",
+    "reveal",
+    "finder"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web" }
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": "^0.2.1-rc.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true }
+  }
+}
